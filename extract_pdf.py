@@ -8,10 +8,9 @@ import fitz  # PyMuPDF
 HYPHENS = r"[-\u2010\u2011\u2012\u2013\u2014\u2212\uFE63\uFF0D]"
 DATE_WORD_RE = re.compile(rf"^\d{{4}}{HYPHENS}\d{{2}}{HYPHENS}\d{{2}}\*?$")
 
-# Typical Primavera IDs: DD1050, MS1010, PR1100, etc.
-ACT_ID_RE = re.compile(r"^[A-Z]{1,3}\d{2,5}$")
-# Package summary codes like S00, A10, U32, E01, M06
-PKG_RE = re.compile(r"^[A-Z]\d{2,3}$")
+# Looser Activity ID: DD1050 / MS1010 / PR1100 / ABC1234 / etc.
+ACT_ID_RE = re.compile(r"^[A-Z]{1,5}\d{2,7}$", re.IGNORECASE)
+PKG_RE = re.compile(r"^[A-Z]\d{2,3}$", re.IGNORECASE)  # S00, A10, U32...
 
 WORKTYPE_RULES = [
     ("Pile diagram", r"\bpile\s+diagram\b"),
@@ -42,12 +41,44 @@ def infer_work_type(name: str) -> str:
     for label, pat in WORKTYPE_RULES:
         if re.search(pat, s):
             return label
-    if (name or "").startswith("MS"):
+    if (name or "").upper().startswith("MS"):
         return "Milestone"
     return "Other"
 
-def is_package_code(act_id: str) -> bool:
-    return bool(PKG_RE.match(act_id or ""))
+def is_package_code(tok: str) -> bool:
+    return bool(PKG_RE.match(tok or ""))
+
+def looks_like_activity_id(tok: str) -> bool:
+    return bool(ACT_ID_RE.match(tok or "")) and not DATE_WORD_RE.match(tok or "")
+
+def group_words_by_y(words, y_tol=0.6):
+    """
+    Group word tuples into 'rows' by similar y0.
+    words tuples: (x0, y0, x1, y1, text, block_no, line_no, word_no)
+    """
+    words_sorted = sorted(words, key=lambda w: (w[1], w[0]))  # y0, x0
+    groups = []
+    cur = []
+    cur_y = None
+
+    for w in words_sorted:
+        x0, y0, x1, y1, txt = w[0], w[1], w[2], w[3], str(w[4]).strip()
+        if not txt:
+            continue
+        if cur_y is None:
+            cur_y = y0
+            cur = [w]
+        else:
+            if abs(y0 - cur_y) <= y_tol:
+                cur.append(w)
+            else:
+                groups.append(sorted(cur, key=lambda z: z[0]))
+                cur_y = y0
+                cur = [w]
+
+    if cur:
+        groups.append(sorted(cur, key=lambda z: z[0]))
+    return groups
 
 def extract(pdf_path: str, out_csv: str):
     rows = []
@@ -58,13 +89,13 @@ def extract(pdf_path: str, out_csv: str):
     doc = fitz.open(pdf_path)
     total_pages = doc.page_count
 
-    debug_kept = 0
+    debug_rows_seen = 0
     debug_samples = []
 
     for page_i in range(total_pages):
         page = doc.load_page(page_i)
 
-        # Best-effort major group detection from normal text
+        # Best effort major group detection from plain text headings
         text = page.get_text("text") or ""
         for ln in (text.splitlines() if text else []):
             l = ln.strip().lower()
@@ -77,45 +108,36 @@ def extract(pdf_path: str, out_csv: str):
             elif l.startswith("main mile"):
                 current_major_group = "Main Milestones"
 
-        words = page.get_text("words")  # (x0,y0,x1,y1,word,block,line,wordno)
+        words = page.get_text("words")
         if not words:
             continue
 
-        # Group by (block_no, line_no) -> true lines from PDF renderer
-        line_map = {}
-        for w in words:
-            x0, y0, x1, y1, txt, block_no, line_no, word_no = w
-            if not txt or not str(txt).strip():
-                continue
-            key = (block_no, line_no)
-            line_map.setdefault(key, []).append(w)
+        # Tight row grouping to avoid merging multiple lines
+        line_groups = group_words_by_y(words, y_tol=0.6)
 
-        # Process lines in reading order
-        for key in sorted(line_map.keys()):
-            line_words = sorted(line_map[key], key=lambda z: z[0])  # sort by x0
-            tokens = [str(z[4]).strip() for z in line_words if str(z[4]).strip()]
-
+        for g in line_groups:
+            tokens = [str(w[4]).strip() for w in g if str(w[4]).strip()]
             if len(tokens) < 4:
                 continue
 
-            # Skip headers
+            # skip obvious headers
             head = " ".join(tokens[:3]).lower()
             if head.startswith("activity id") or head.startswith("activityid"):
                 continue
             if tokens[0].lower() in ("month", "page"):
                 continue
 
-            act_id = tokens[0]
-
-            # Only keep lines that look like activity rows or package lines
-            if not (ACT_ID_RE.match(act_id) or is_package_code(act_id)):
-                continue
-
-            # Find date tokens in this line
+            # Find all date tokens
             date_idxs = [i for i, t in enumerate(tokens) if DATE_WORD_RE.match(t)]
             if len(date_idxs) < 2:
                 continue
 
+            # Debug: we found a row-like line with dates
+            debug_rows_seen += 1
+            if len(debug_samples) < 12:
+                debug_samples.append(" | ".join(tokens))
+
+            # Choose start/finish as last two date tokens
             s_idx, f_idx = date_idxs[-2], date_idxs[-1]
             start_tok, finish_tok = tokens[s_idx], tokens[f_idx]
 
@@ -125,31 +147,39 @@ def extract(pdf_path: str, out_csv: str):
             except Exception:
                 continue
 
-            # Activity name tokens between ID and Start date
-            name = " ".join(tokens[1:s_idx]).strip()
+            # Find an activity id token BEFORE the start date (usually first token)
+            act_id = None
+            act_pos = None
+            for i in range(0, s_idx):
+                if looks_like_activity_id(tokens[i]):
+                    act_id = tokens[i]
+                    act_pos = i
+                    break
+
+            # If we can't find an activity id, skip (avoids garbage rows)
+            if not act_id:
+                continue
+
+            # Activity name is between act_id and start date
+            name_tokens = tokens[act_pos + 1 : s_idx]
+            name = " ".join(name_tokens).strip()
             if not name:
                 continue
 
-            # Update package context if this is a package summary row
+            # Update package context if this looks like package summary row
             if is_package_code(act_id):
-                current_package_code = act_id
+                current_package_code = act_id.upper()
                 current_package_name = name
 
-            # Duration + sanity checks
             duration_days = (finish_d - start_d).days
-            # If negative, it's likely parsing mismatch -> skip row
             if duration_days < 0:
                 continue
-
-            debug_kept += 1
-            if len(debug_samples) < 10:
-                debug_samples.append(" | ".join(tokens))
 
             rows.append({
                 "major_group": current_major_group or "Unknown",
                 "package_code": current_package_code,
                 "package_name": current_package_name,
-                "activity_id": act_id,
+                "activity_id": act_id.upper(),
                 "activity_name": name,
                 "work_type": infer_work_type(name),
                 "start": start_d.isoformat(),
@@ -163,8 +193,9 @@ def extract(pdf_path: str, out_csv: str):
             })
 
     print(f"[DEBUG] PDF pages: {total_pages}")
-    print(f"[DEBUG] Extracted rows kept: {debug_kept}")
-    print("[DEBUG] Sample kept lines:")
+    print(f"[DEBUG] Lines with >=2 dates detected (pre-filter): {debug_rows_seen}")
+    print(f"[DEBUG] Extracted final rows: {len(rows)}")
+    print("[DEBUG] Sample date-lines (tokenized):")
     for s in debug_samples:
         print("   ", s)
 
@@ -172,7 +203,6 @@ def extract(pdf_path: str, out_csv: str):
         "major_group","package_code","package_name","activity_id","activity_name","work_type",
         "start","finish","duration_days","is_milestone","source_page","pdf_pages","start_star","finish_star"
     ]
-
     out_path = Path(out_csv)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
