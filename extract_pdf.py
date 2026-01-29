@@ -4,7 +4,9 @@ from dateutil.parser import parse as dtparse
 import pandas as pd
 import fitz  # PyMuPDF
 
-DATE_TOKEN = re.compile(r"^\d{4}-\d{2}-\d{2}\*?$")
+# Accept normal hyphen '-' and common unicode hyphens in PDFs
+HYPHENS = r"[-\u2010\u2011\u2012\u2013\u2014\u2212\uFE63\uFF0D]"
+DATE_IN_TEXT = re.compile(rf"(\d{{4}}){HYPHENS}(\d{{2}}){HYPHENS}(\d{{2}})\*?")
 
 WORKTYPE_RULES = [
     ("Pile diagram", r"\bpile\s+diagram\b"),
@@ -19,16 +21,6 @@ WORKTYPE_RULES = [
     ("Shipping", r"\bshipping\b"),
 ]
 
-def normalize_date(token: str):
-    token = (token or "").strip()
-    has_star = token.endswith("*")
-    token_clean = token.replace("*", "")
-    try:
-        d = dtparse(token_clean).date()
-        return d, has_star
-    except Exception:
-        return None, has_star
-
 def infer_work_type(name: str) -> str:
     s = (name or "").lower()
     for label, pat in WORKTYPE_RULES:
@@ -39,19 +31,14 @@ def infer_work_type(name: str) -> str:
     return "Other"
 
 def is_package_code(act_id: str) -> bool:
-    # S00, A10, U32, E01, M06, etc.
-    return bool(re.match(r"^[A-Z]\d{2,3}$", act_id or ""))
+    return bool(re.match(r"^[A-Z]\d{2,3}$", act_id or ""))  # S01, A00, U32, etc.
 
-def find_last_two_dates(parts):
-    """
-    Find last two date-like tokens anywhere in the split tokens.
-    Returns (start_token, finish_token, start_index, finish_index) or (None,...)
-    """
-    idxs = [i for i, p in enumerate(parts) if DATE_TOKEN.match(p)]
-    if len(idxs) < 2:
-        return None, None, None, None
-    s_idx, f_idx = idxs[-2], idxs[-1]
-    return parts[s_idx], parts[f_idx], s_idx, f_idx
+def normalize_date_str(date_str: str) -> str:
+    # Convert unicode hyphens to normal '-' and strip trailing '*'
+    clean = date_str.replace("*", "")
+    clean = re.sub(HYPHENS, "-", clean)
+    # Parse to ISO to guarantee CSV consistency
+    return dtparse(clean).date().isoformat()
 
 def extract(pdf_path: str, out_csv: str):
     rows = []
@@ -62,8 +49,8 @@ def extract(pdf_path: str, out_csv: str):
     doc = fitz.open(pdf_path)
     total_pages = doc.page_count
 
-    debug_found_lines = 0
-    debug_sample_activity_lines = []
+    debug_activity_lines = []
+    extracted_lines_count = 0
 
     for page_i in range(total_pages):
         text = doc.load_page(page_i).get_text("text") or ""
@@ -86,35 +73,45 @@ def extract(pdf_path: str, out_csv: str):
 
         for ln in lines:
             l = ln.lower()
-            # skip headers/axes/footers
             if l.startswith("activity id") or l.startswith("month") or l.startswith("page "):
                 continue
             if ln.startswith("-1 "):
                 continue
 
+            # Find all date occurrences in the line (supports unicode hyphens)
+            dates = [m.group(0) for m in DATE_IN_TEXT.finditer(ln)]
+            if len(dates) < 2:
+                continue
+
+            # Take last two as Start/Finish
+            start_raw, finish_raw = dates[-2], dates[-1]
+            try:
+                start_iso = normalize_date_str(start_raw)
+                finish_iso = normalize_date_str(finish_raw)
+            except Exception:
+                continue
+
+            # Activity ID is typically first token
             parts = ln.split()
-            if len(parts) < 4:
+            if len(parts) < 2:
                 continue
-
-            start_tok, finish_tok, s_idx, f_idx = find_last_two_dates(parts)
-            if start_tok is None:
-                continue
-
-            # activity id is usually first token
             act_id = parts[0]
 
-            # activity name is everything between act_id and the start date token
-            name_tokens = parts[1:s_idx]
-            name = " ".join(name_tokens).strip()
+            # Activity name = line with dates removed, minus activity id
+            # Remove the last two dates from the line text
+            ln_wo_finish = re.sub(re.escape(finish_raw), "", ln, count=1)
+            ln_wo_both = re.sub(re.escape(start_raw), "", ln_wo_finish, count=1)
+            # Now remove the activity id from the beginning
+            name = ln_wo_both.strip()
+            if name.startswith(act_id):
+                name = name[len(act_id):].strip()
 
-            start_d, start_star = normalize_date(start_tok)
-            finish_d, finish_star = normalize_date(finish_tok)
-            if start_d is None or finish_d is None:
+            if not name:
                 continue
 
-            debug_found_lines += 1
-            if len(debug_sample_activity_lines) < 12:
-                debug_sample_activity_lines.append(ln)
+            extracted_lines_count += 1
+            if len(debug_activity_lines) < 12:
+                debug_activity_lines.append(ln)
 
             # update package context if this is a package summary line
             if is_package_code(act_id):
@@ -128,29 +125,25 @@ def extract(pdf_path: str, out_csv: str):
                 "activity_id": act_id,
                 "activity_name": name,
                 "work_type": infer_work_type(name),
-                # write dates as ISO strings (most reliable for Streamlit parsing)
-                "start": start_d.isoformat(),
-                "finish": finish_d.isoformat(),
-                "duration_days": (finish_d - start_d).days,
-                "is_milestone": start_d == finish_d,
+                "start": start_iso,
+                "finish": finish_iso,
                 "source_page": page_i + 1,
                 "pdf_pages": total_pages,
-                "start_star": bool(start_star),
-                "finish_star": bool(finish_star),
             })
 
     print(f"[DEBUG] PDF pages: {total_pages}")
-    print(f"[DEBUG] Extracted activity-like lines: {debug_found_lines}")
+    print(f"[DEBUG] Extracted candidate lines: {extracted_lines_count}")
     print("[DEBUG] Sample extracted lines:")
-    for s in debug_sample_activity_lines:
+    for s in debug_activity_lines:
         print("   ", s)
 
+    # Always write a CSV (even if empty) but now it should not be empty
     headers = [
         "major_group","package_code","package_name","activity_id","activity_name","work_type",
-        "start","finish","duration_days","is_milestone","source_page","pdf_pages","start_star","finish_star"
+        "start","finish","source_page","pdf_pages"
     ]
-
     df = pd.DataFrame(rows)
+
     Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
 
     if df.empty:
@@ -159,9 +152,7 @@ def extract(pdf_path: str, out_csv: str):
         return
 
     df = df.drop_duplicates(subset=["activity_id","activity_name","start","finish"])
-    # safe sort (package_code can be None)
     df = df.sort_values(["package_code","start","finish","activity_id"], na_position="last").reset_index(drop=True)
-
     df.to_csv(out_csv, index=False)
     print(f"[OK] Saved {len(df)} rows → {out_csv}")
 
