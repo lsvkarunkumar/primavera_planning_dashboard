@@ -8,8 +8,8 @@ import fitz  # PyMuPDF
 HYPHENS = r"[-\u2010\u2011\u2012\u2013\u2014\u2212\uFE63\uFF0D]"
 DATE_WORD_RE = re.compile(rf"^\d{{4}}{HYPHENS}\d{{2}}{HYPHENS}\d{{2}}\*?$")
 
-# Looser Activity ID: DD1050 / MS1010 / PR1100 / ABC1234 / etc.
-ACT_ID_RE = re.compile(r"^[A-Z]{1,5}\d{2,7}$", re.IGNORECASE)
+# Activity IDs are usually letters+digits (DD1050 / MS1010 / PR1100 etc.)
+ACT_ID_RE = re.compile(r"^[A-Z]{1,6}\d{2,7}$", re.IGNORECASE)
 PKG_RE = re.compile(r"^[A-Z]\d{2,3}$", re.IGNORECASE)  # S00, A10, U32...
 
 WORKTYPE_RULES = [
@@ -49,36 +49,8 @@ def is_package_code(tok: str) -> bool:
     return bool(PKG_RE.match(tok or ""))
 
 def looks_like_activity_id(tok: str) -> bool:
-    return bool(ACT_ID_RE.match(tok or "")) and not DATE_WORD_RE.match(tok or "")
-
-def group_words_by_y(words, y_tol=0.6):
-    """
-    Group word tuples into 'rows' by similar y0.
-    words tuples: (x0, y0, x1, y1, text, block_no, line_no, word_no)
-    """
-    words_sorted = sorted(words, key=lambda w: (w[1], w[0]))  # y0, x0
-    groups = []
-    cur = []
-    cur_y = None
-
-    for w in words_sorted:
-        x0, y0, x1, y1, txt = w[0], w[1], w[2], w[3], str(w[4]).strip()
-        if not txt:
-            continue
-        if cur_y is None:
-            cur_y = y0
-            cur = [w]
-        else:
-            if abs(y0 - cur_y) <= y_tol:
-                cur.append(w)
-            else:
-                groups.append(sorted(cur, key=lambda z: z[0]))
-                cur_y = y0
-                cur = [w]
-
-    if cur:
-        groups.append(sorted(cur, key=lambda z: z[0]))
-    return groups
+    tok = (tok or "").strip()
+    return bool(ACT_ID_RE.match(tok)) and not bool(DATE_WORD_RE.match(tok))
 
 def extract(pdf_path: str, out_csv: str):
     rows = []
@@ -89,13 +61,15 @@ def extract(pdf_path: str, out_csv: str):
     doc = fitz.open(pdf_path)
     total_pages = doc.page_count
 
-    debug_rows_seen = 0
+    debug_fragments = 0
+    debug_merged_rows = 0
+    debug_final_rows = 0
     debug_samples = []
 
     for page_i in range(total_pages):
         page = doc.load_page(page_i)
 
-        # Best effort major group detection from plain text headings
+        # Best-effort major group detection from headings
         text = page.get_text("text") or ""
         for ln in (text.splitlines() if text else []):
             l = ln.strip().lower()
@@ -108,78 +82,126 @@ def extract(pdf_path: str, out_csv: str):
             elif l.startswith("main mile"):
                 current_major_group = "Main Milestones"
 
-        words = page.get_text("words")
+        words = page.get_text("words")  # (x0,y0,x1,y1,word,block,line,wordno)
         if not words:
             continue
 
-        # Tight row grouping to avoid merging multiple lines
-        line_groups = group_words_by_y(words, y_tol=0.6)
+        # 1) Build "line fragments" by (block_no, line_no)
+        frag_map = {}
+        for w in words:
+            x0, y0, x1, y1, txt, block_no, line_no, word_no = w
+            txt = str(txt).strip()
+            if not txt:
+                continue
+            key = (block_no, line_no)
+            frag_map.setdefault(key, []).append(w)
 
-        for g in line_groups:
-            tokens = [str(w[4]).strip() for w in g if str(w[4]).strip()]
+        fragments = []
+        for key, ws in frag_map.items():
+            ws_sorted = sorted(ws, key=lambda z: z[0])  # sort by x0
+            tokens = [str(z[4]).strip() for z in ws_sorted if str(z[4]).strip()]
+            if not tokens:
+                continue
+            x0 = min(z[0] for z in ws_sorted)
+            x1 = max(z[2] for z in ws_sorted)
+            y0 = min(z[1] for z in ws_sorted)
+            y1 = max(z[3] for z in ws_sorted)
+            ymid = (y0 + y1) / 2.0
+            fragments.append({
+                "x0": x0, "x1": x1, "y0": y0, "y1": y1, "ymid": ymid,
+                "tokens": tokens
+            })
+
+        debug_fragments += len(fragments)
+
+        # 2) Cluster fragments into logical rows by Y (merge columns)
+        # Sort by ymid then x0
+        fragments.sort(key=lambda f: (f["ymid"], f["x0"]))
+
+        row_clusters = []
+        cur = []
+        cur_y = None
+        Y_TOL = 2.0  # key change: merge left+right columns of same row
+
+        for frag in fragments:
+            if cur_y is None:
+                cur = [frag]
+                cur_y = frag["ymid"]
+            else:
+                if abs(frag["ymid"] - cur_y) <= Y_TOL:
+                    cur.append(frag)
+                else:
+                    row_clusters.append(cur)
+                    cur = [frag]
+                    cur_y = frag["ymid"]
+        if cur:
+            row_clusters.append(cur)
+
+        # 3) Parse each merged row
+        for row in row_clusters:
+            # Sort fragments left-to-right and flatten tokens
+            row = sorted(row, key=lambda f: f["x0"])
+            tokens = []
+            for f in row:
+                tokens.extend(f["tokens"])
+
             if len(tokens) < 4:
                 continue
 
-            # skip obvious headers
+            # Skip obvious headers
             head = " ".join(tokens[:3]).lower()
             if head.startswith("activity id") or head.startswith("activityid"):
                 continue
             if tokens[0].lower() in ("month", "page"):
                 continue
 
-            # Find all date tokens
+            # Find date tokens anywhere in merged tokens
             date_idxs = [i for i, t in enumerate(tokens) if DATE_WORD_RE.match(t)]
             if len(date_idxs) < 2:
                 continue
 
-            # Debug: we found a row-like line with dates
-            debug_rows_seen += 1
-            if len(debug_samples) < 12:
-                debug_samples.append(" | ".join(tokens))
+            debug_merged_rows += 1
+            if len(debug_samples) < 10:
+                debug_samples.append(" | ".join(tokens[:25]))  # keep short sample
 
-            # Choose start/finish as last two date tokens
             s_idx, f_idx = date_idxs[-2], date_idxs[-1]
-            start_tok, finish_tok = tokens[s_idx], tokens[f_idx]
-
             try:
-                start_d, start_star = parse_date_word(start_tok)
-                finish_d, finish_star = parse_date_word(finish_tok)
+                start_d, start_star = parse_date_word(tokens[s_idx])
+                finish_d, finish_star = parse_date_word(tokens[f_idx])
             except Exception:
                 continue
 
-            # Find an activity id token BEFORE the start date (usually first token)
+            # Find activity id token before the start date
             act_id = None
             act_pos = None
             for i in range(0, s_idx):
                 if looks_like_activity_id(tokens[i]):
-                    act_id = tokens[i]
+                    act_id = tokens[i].upper()
                     act_pos = i
                     break
-
-            # If we can't find an activity id, skip (avoids garbage rows)
             if not act_id:
                 continue
 
-            # Activity name is between act_id and start date
-            name_tokens = tokens[act_pos + 1 : s_idx]
-            name = " ".join(name_tokens).strip()
+            # Name is between activity id and start date
+            name = " ".join(tokens[act_pos + 1 : s_idx]).strip()
             if not name:
                 continue
 
-            # Update package context if this looks like package summary row
+            # Update package context (package row)
             if is_package_code(act_id):
-                current_package_code = act_id.upper()
+                current_package_code = act_id
                 current_package_name = name
 
             duration_days = (finish_d - start_d).days
             if duration_days < 0:
                 continue
 
+            debug_final_rows += 1
             rows.append({
                 "major_group": current_major_group or "Unknown",
                 "package_code": current_package_code,
                 "package_name": current_package_name,
-                "activity_id": act_id.upper(),
+                "activity_id": act_id,
                 "activity_name": name,
                 "work_type": infer_work_type(name),
                 "start": start_d.isoformat(),
@@ -193,9 +215,10 @@ def extract(pdf_path: str, out_csv: str):
             })
 
     print(f"[DEBUG] PDF pages: {total_pages}")
-    print(f"[DEBUG] Lines with >=2 dates detected (pre-filter): {debug_rows_seen}")
-    print(f"[DEBUG] Extracted final rows: {len(rows)}")
-    print("[DEBUG] Sample date-lines (tokenized):")
+    print(f"[DEBUG] Total line-fragments built: {debug_fragments}")
+    print(f"[DEBUG] Merged rows with >=2 dates: {debug_merged_rows}")
+    print(f"[DEBUG] Final extracted rows saved: {debug_final_rows}")
+    print("[DEBUG] Sample merged token rows (first 25 tokens each):")
     for s in debug_samples:
         print("   ", s)
 
@@ -203,10 +226,9 @@ def extract(pdf_path: str, out_csv: str):
         "major_group","package_code","package_name","activity_id","activity_name","work_type",
         "start","finish","duration_days","is_milestone","source_page","pdf_pages","start_star","finish_star"
     ]
-    out_path = Path(out_csv)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
+    Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(rows)
+
     if df.empty:
         print("[WARN] No rows extracted. Writing empty CSV with headers.")
         pd.DataFrame(columns=headers).to_csv(out_csv, index=False)
