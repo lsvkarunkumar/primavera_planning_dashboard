@@ -4,8 +4,13 @@ from dateutil.parser import parse as dtparse
 import pandas as pd
 import fitz  # PyMuPDF
 
-HYPHENS = r"[-\u2010\u2011\u2012\u2013\u2014\u2212\uFE63\uFF0D]"
-DATE_WORD_RE = re.compile(rf"^\d{{4}}{HYPHENS}\d{{2}}{HYPHENS}\d{{2}}\*?$")
+# year / month / day numeric tokens
+YEAR_RE = re.compile(r"^\d{4}$")
+MD_RE = re.compile(r"^\d{2}$")
+STAR_RE = re.compile(r"^\*$")
+
+# Hyphen-like tokens can appear as standalone characters in PDFs
+HYPHEN_CHARS = set(["-", "‐", "-", "‒", "–", "—", "−", "﹣", "－"])
 
 ACT_ID_RE = re.compile(r"^[A-Z]{1,6}\d{2,7}$", re.IGNORECASE)
 PKG_RE = re.compile(r"^[A-Z]\d{2,3}$", re.IGNORECASE)
@@ -24,33 +29,9 @@ WORKTYPE_RULES = [
 ]
 
 def normalize_token(t: str) -> str:
-    """Remove hidden PDF characters and normalize hyphens."""
     t = (t or "").strip()
-    # Remove zero-width / non-breaking spaces often present in PDFs
     t = t.replace("\u200b", "").replace("\ufeff", "").replace("\xa0", " ")
-    # Normalize weird hyphens to standard '-'
-    t = re.sub(HYPHENS, "-", t)
     return t
-
-def is_date_token(t: str) -> bool:
-    t = normalize_token(t)
-    # allow optional trailing '*'
-    return bool(re.match(r"^\d{4}-\d{2}-\d{2}\*?$", t))
-
-def parse_date_token(t: str):
-    t = normalize_token(t)
-    star = t.endswith("*")
-    t = t.replace("*", "")
-    d = dtparse(t).date()
-    return d, star
-
-def looks_like_activity_id(tok: str) -> bool:
-    tok = normalize_token(tok)
-    return bool(ACT_ID_RE.match(tok)) and not is_date_token(tok)
-
-def is_package_code(tok: str) -> bool:
-    tok = normalize_token(tok)
-    return bool(PKG_RE.match(tok))
 
 def infer_work_type(name: str) -> str:
     s = (name or "").lower()
@@ -60,6 +41,18 @@ def infer_work_type(name: str) -> str:
     if (name or "").upper().startswith("MS"):
         return "Milestone"
     return "Other"
+
+def looks_like_activity_id(tok: str) -> bool:
+    tok = normalize_token(tok)
+    return bool(ACT_ID_RE.match(tok))
+
+def is_package_code(tok: str) -> bool:
+    tok = normalize_token(tok)
+    return bool(PKG_RE.match(tok))
+
+def parse_date_iso(date_iso: str):
+    d = dtparse(date_iso).date()
+    return d
 
 def build_lines(words):
     """Group by (block_no, line_no) to get stable fragments."""
@@ -74,7 +67,7 @@ def build_lines(words):
 
     lines = []
     for key, ws in line_map.items():
-        ws_sorted = sorted(ws, key=lambda z: z[0])  # sort by x0
+        ws_sorted = sorted(ws, key=lambda z: z[0])  # x0
         tokens = [z[4] for z in ws_sorted if z[4]]
         if not tokens:
             continue
@@ -85,6 +78,40 @@ def build_lines(words):
         ymid = (y0 + y1) / 2.0
         lines.append({"x0": x0, "x1": x1, "y0": y0, "y1": y1, "ymid": ymid, "tokens": tokens})
     return lines
+
+def extract_dates_from_tokens(tokens):
+    """
+    Return list of dicts: {"idx": index_of_first_token, "iso": "YYYY-MM-DD", "star": bool}
+    Handles split forms: YYYY - MM - DD [*] where '-' token may be unicode.
+    """
+    dates = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        t0 = normalize_token(tokens[i])
+        if YEAR_RE.match(t0):
+            # Expect: YYYY, hyphen, MM, hyphen, DD, optional '*'
+            if i + 4 < n:
+                t1 = normalize_token(tokens[i+1])
+                t2 = normalize_token(tokens[i+2])
+                t3 = normalize_token(tokens[i+3])
+                t4 = normalize_token(tokens[i+4])
+
+                if (t1 in HYPHEN_CHARS) and MD_RE.match(t2) and (t3 in HYPHEN_CHARS) and MD_RE.match(t4):
+                    star = False
+                    # optional '*' in next token OR appended to DD token
+                    j = i + 5
+                    if j < n:
+                        nxt = normalize_token(tokens[j])
+                        if nxt == "*":
+                            star = True
+                            j += 1
+                    iso = f"{t0}-{t2}-{t4}"
+                    dates.append({"idx": i, "iso": iso, "star": star})
+                    i = j
+                    continue
+        i += 1
+    return dates
 
 def extract(pdf_path: str, out_csv: str):
     rows = []
@@ -137,7 +164,7 @@ def extract(pdf_path: str, out_csv: str):
             if toks[0].lower() in ("month", "page"):
                 continue
 
-            # Identify ID line
+            # ID line: find first activity-id-like token in first few tokens
             act_id = None
             act_pos = None
             for i in range(min(6, len(toks))):
@@ -145,26 +172,16 @@ def extract(pdf_path: str, out_csv: str):
                     act_id = normalize_token(toks[i]).upper()
                     act_pos = i
                     break
-
-            # Identify DATE line (>=2 date tokens anywhere)
-            date_idxs = [i for i, t in enumerate(toks) if is_date_token(t)]
-            if len(date_idxs) >= 2:
-                date_lines.append({
-                    "ymid": ln["ymid"],
-                    "tokens": toks,
-                    "date_idxs": date_idxs,
-                })
-                if len(debug_date_samples) < 8:
-                    debug_date_samples.append(" | ".join(toks[:30]))
-
             if act_id:
-                name = " ".join(toks[act_pos + 1:]).strip()
-                id_lines.append({
-                    "ymid": ln["ymid"],
-                    "activity_id": act_id,
-                    "activity_name": name,
-                    "raw": " | ".join(toks[:30]),
-                })
+                name = " ".join(normalize_token(x) for x in toks[act_pos+1:]).strip()
+                id_lines.append({"ymid": ln["ymid"], "activity_id": act_id, "activity_name": name, "raw": " | ".join(toks[:30])})
+
+            # Date line: extract reconstructed dates from tokens
+            found_dates = extract_dates_from_tokens(toks)
+            if len(found_dates) >= 2:
+                date_lines.append({"ymid": ln["ymid"], "dates": found_dates, "raw": " | ".join(toks[:40])})
+                if len(debug_date_samples) < 8:
+                    debug_date_samples.append(" | ".join(toks[:40]))
 
         id_lines.sort(key=lambda r: r["ymid"])
         date_lines.sort(key=lambda r: r["ymid"])
@@ -175,8 +192,8 @@ def extract(pdf_path: str, out_csv: str):
         if not id_lines or not date_lines:
             continue
 
-        # Join by nearest Y
-        Y_JOIN_MAX = 10.0
+        # Join date lines to nearest ID line by Y
+        Y_JOIN_MAX = 12.0
 
         def nearest_id(y):
             best = None
@@ -193,11 +210,12 @@ def extract(pdf_path: str, out_csv: str):
             if not lr or dist > Y_JOIN_MAX:
                 continue
 
-            # start/finish are last 2 date tokens on that date-line
-            s_idx, f_idx = dl["date_idxs"][-2], dl["date_idxs"][-1]
+            start = dl["dates"][-2]
+            finish = dl["dates"][-1]
+
             try:
-                start_d, start_star = parse_date_token(dl["tokens"][s_idx])
-                finish_d, finish_star = parse_date_token(dl["tokens"][f_idx])
+                start_d = parse_date_iso(start["iso"])
+                finish_d = parse_date_iso(finish["iso"])
             except Exception:
                 continue
 
@@ -214,7 +232,7 @@ def extract(pdf_path: str, out_csv: str):
 
             debug_joined += 1
             if len(debug_join_samples) < 6:
-                debug_join_samples.append(f"ydist={dist:.2f} | ID: {lr['raw']} || DATES: {' | '.join(dl['tokens'][:25])}")
+                debug_join_samples.append(f"ydist={dist:.2f} | ID: {lr['raw']} || DATES: {dl['raw']}")
 
             rows.append({
                 "major_group": current_major_group or "Unknown",
@@ -229,15 +247,15 @@ def extract(pdf_path: str, out_csv: str):
                 "is_milestone": start_d == finish_d,
                 "source_page": page_i + 1,
                 "pdf_pages": total_pages,
-                "start_star": bool(start_star),
-                "finish_star": bool(finish_star),
+                "start_star": bool(start.get("star", False)),
+                "finish_star": bool(finish.get("star", False)),
             })
 
     print(f"[DEBUG] PDF pages: {total_pages}")
     print(f"[DEBUG] ID lines found total: {debug_id_lines}")
-    print(f"[DEBUG] Date lines found total: {debug_date_lines}")
+    print(f"[DEBUG] Date lines found total (reconstructed): {debug_date_lines}")
     print(f"[DEBUG] Joined rows produced: {debug_joined}")
-    print("[DEBUG] Sample date lines:")
+    print("[DEBUG] Sample date lines (tokens):")
     for s in debug_date_samples:
         print("   ", s)
     print("[DEBUG] Sample joins:")
