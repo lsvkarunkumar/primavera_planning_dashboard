@@ -7,7 +7,6 @@ import fitz  # PyMuPDF
 HYPHENS = r"[-\u2010\u2011\u2012\u2013\u2014\u2212\uFE63\uFF0D]"
 DATE_WORD_RE = re.compile(rf"^\d{{4}}{HYPHENS}\d{{2}}{HYPHENS}\d{{2}}\*?$")
 
-# Allow many Primavera-style IDs: DD1050, MS1010, PR1100, A00, S01, etc.
 ACT_ID_RE = re.compile(r"^[A-Z]{1,6}\d{2,7}$", re.IGNORECASE)
 PKG_RE = re.compile(r"^[A-Z]\d{2,3}$", re.IGNORECASE)
 
@@ -24,16 +23,34 @@ WORKTYPE_RULES = [
     ("Shipping", r"\bshipping\b"),
 ]
 
-def normalize_hyphens(s: str) -> str:
-    return re.sub(HYPHENS, "-", s)
+def normalize_token(t: str) -> str:
+    """Remove hidden PDF characters and normalize hyphens."""
+    t = (t or "").strip()
+    # Remove zero-width / non-breaking spaces often present in PDFs
+    t = t.replace("\u200b", "").replace("\ufeff", "").replace("\xa0", " ")
+    # Normalize weird hyphens to standard '-'
+    t = re.sub(HYPHENS, "-", t)
+    return t
 
-def parse_date_word(w: str):
-    w = (w or "").strip()
-    star = w.endswith("*")
-    w = w.replace("*", "")
-    w = normalize_hyphens(w)
-    d = dtparse(w).date()
+def is_date_token(t: str) -> bool:
+    t = normalize_token(t)
+    # allow optional trailing '*'
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2}\*?$", t))
+
+def parse_date_token(t: str):
+    t = normalize_token(t)
+    star = t.endswith("*")
+    t = t.replace("*", "")
+    d = dtparse(t).date()
     return d, star
+
+def looks_like_activity_id(tok: str) -> bool:
+    tok = normalize_token(tok)
+    return bool(ACT_ID_RE.match(tok)) and not is_date_token(tok)
+
+def is_package_code(tok: str) -> bool:
+    tok = normalize_token(tok)
+    return bool(PKG_RE.match(tok))
 
 def infer_work_type(name: str) -> str:
     s = (name or "").lower()
@@ -44,28 +61,21 @@ def infer_work_type(name: str) -> str:
         return "Milestone"
     return "Other"
 
-def looks_like_activity_id(tok: str) -> bool:
-    tok = (tok or "").strip()
-    return bool(ACT_ID_RE.match(tok)) and not bool(DATE_WORD_RE.match(tok))
-
-def is_package_code(tok: str) -> bool:
-    return bool(PKG_RE.match(tok or ""))
-
 def build_lines(words):
     """Group by (block_no, line_no) to get stable fragments."""
     line_map = {}
     for w in words:
         x0, y0, x1, y1, txt, block_no, line_no, word_no = w
-        txt = str(txt).strip()
+        txt = normalize_token(str(txt))
         if not txt:
             continue
         key = (block_no, line_no)
-        line_map.setdefault(key, []).append(w)
+        line_map.setdefault(key, []).append((x0, y0, x1, y1, txt))
 
     lines = []
     for key, ws in line_map.items():
-        ws_sorted = sorted(ws, key=lambda z: z[0])  # x0
-        tokens = [str(z[4]).strip() for z in ws_sorted if str(z[4]).strip()]
+        ws_sorted = sorted(ws, key=lambda z: z[0])  # sort by x0
+        tokens = [z[4] for z in ws_sorted if z[4]]
         if not tokens:
             continue
         x0 = min(z[0] for z in ws_sorted)
@@ -85,10 +95,11 @@ def extract(pdf_path: str, out_csv: str):
     doc = fitz.open(pdf_path)
     total_pages = doc.page_count
 
-    debug_left = 0
-    debug_right = 0
+    debug_id_lines = 0
+    debug_date_lines = 0
     debug_joined = 0
-    debug_samples = []
+    debug_date_samples = []
+    debug_join_samples = []
 
     for page_i in range(total_pages):
         page = doc.load_page(page_i)
@@ -110,93 +121,83 @@ def extract(pdf_path: str, out_csv: str):
         if not words:
             continue
 
-        page_width = page.rect.width
-        split_x = page_width * 0.50  # left vs right split
-
         lines = build_lines(words)
 
-        # Separate left and right line fragments by x0
-        left_lines = [ln for ln in lines if ln["x0"] < split_x]
-        right_lines = [ln for ln in lines if ln["x0"] >= split_x]
+        id_lines = []
+        date_lines = []
 
-        # LEFT: keep only lines that have an activity id-like token
-        left_rows = []
-        for ln in left_lines:
+        for ln in lines:
             toks = ln["tokens"]
-            # skip headers
+            if len(toks) < 2:
+                continue
+
             head = " ".join(toks[:3]).lower() if len(toks) >= 3 else " ".join(toks).lower()
             if head.startswith("activity id") or head.startswith("activityid"):
                 continue
-            if toks and toks[0].lower() in ("month", "page"):
+            if toks[0].lower() in ("month", "page"):
                 continue
 
-            # find first activity id token in the line
+            # Identify ID line
             act_id = None
             act_pos = None
-            for i, t in enumerate(toks[:6]):  # usually early
-                if looks_like_activity_id(t):
-                    act_id = t.upper()
+            for i in range(min(6, len(toks))):
+                if looks_like_activity_id(toks[i]):
+                    act_id = normalize_token(toks[i]).upper()
                     act_pos = i
                     break
-            if not act_id:
-                continue
 
-            name = " ".join(toks[act_pos + 1:]).strip()
-            if not name:
-                name = ""  # allow empty, we still want to match with dates
+            # Identify DATE line (>=2 date tokens anywhere)
+            date_idxs = [i for i, t in enumerate(toks) if is_date_token(t)]
+            if len(date_idxs) >= 2:
+                date_lines.append({
+                    "ymid": ln["ymid"],
+                    "tokens": toks,
+                    "date_idxs": date_idxs,
+                })
+                if len(debug_date_samples) < 8:
+                    debug_date_samples.append(" | ".join(toks[:30]))
 
-            left_rows.append({
-                "ymid": ln["ymid"],
-                "activity_id": act_id,
-                "activity_name": name,
-                "raw": " | ".join(toks[:25]),
-            })
-        left_rows.sort(key=lambda r: r["ymid"])
-        debug_left += len(left_rows)
+            if act_id:
+                name = " ".join(toks[act_pos + 1:]).strip()
+                id_lines.append({
+                    "ymid": ln["ymid"],
+                    "activity_id": act_id,
+                    "activity_name": name,
+                    "raw": " | ".join(toks[:30]),
+                })
 
-        # RIGHT: keep only lines with >=2 date tokens
-        right_rows = []
-        for ln in right_lines:
-            toks = ln["tokens"]
-            date_idxs = [i for i, t in enumerate(toks) if DATE_WORD_RE.match(t)]
-            if len(date_idxs) < 2:
-                continue
-            s_idx, f_idx = date_idxs[-2], date_idxs[-1]
-            right_rows.append({
-                "ymid": ln["ymid"],
-                "start_tok": toks[s_idx],
-                "finish_tok": toks[f_idx],
-                "raw": " | ".join(toks[:25]),
-            })
-        right_rows.sort(key=lambda r: r["ymid"])
-        debug_right += len(right_rows)
+        id_lines.sort(key=lambda r: r["ymid"])
+        date_lines.sort(key=lambda r: r["ymid"])
 
-        if not left_rows or not right_rows:
+        debug_id_lines += len(id_lines)
+        debug_date_lines += len(date_lines)
+
+        if not id_lines or not date_lines:
             continue
 
-        # Helper: find nearest left row by y
-        # (left rows are sorted by ymid)
-        def nearest_left(y):
-            # binary-ish scan: linear is ok (counts per page small), keep simple
+        # Join by nearest Y
+        Y_JOIN_MAX = 10.0
+
+        def nearest_id(y):
             best = None
             best_d = 1e9
-            for r in left_rows:
+            for r in id_lines:
                 d = abs(r["ymid"] - y)
                 if d < best_d:
                     best_d = d
                     best = r
             return best, best_d
 
-        # Join right date rows to nearest left id/name row
-        Y_JOIN_MAX = 6.0  # allow a bit of offset
-        for rr in right_rows:
-            lr, dist = nearest_left(rr["ymid"])
+        for dl in date_lines:
+            lr, dist = nearest_id(dl["ymid"])
             if not lr or dist > Y_JOIN_MAX:
                 continue
 
+            # start/finish are last 2 date tokens on that date-line
+            s_idx, f_idx = dl["date_idxs"][-2], dl["date_idxs"][-1]
             try:
-                start_d, start_star = parse_date_word(rr["start_tok"])
-                finish_d, finish_star = parse_date_word(rr["finish_tok"])
+                start_d, start_star = parse_date_token(dl["tokens"][s_idx])
+                finish_d, finish_star = parse_date_token(dl["tokens"][f_idx])
             except Exception:
                 continue
 
@@ -207,16 +208,13 @@ def extract(pdf_path: str, out_csv: str):
             act_id = lr["activity_id"]
             name = lr["activity_name"]
 
-            # package context update
             if is_package_code(act_id):
                 current_package_code = act_id
                 current_package_name = name
 
             debug_joined += 1
-            if len(debug_samples) < 10:
-                debug_samples.append(
-                    f"JOIN ydist={dist:.2f} | L: {lr['raw']} || R: {rr['raw']}"
-                )
+            if len(debug_join_samples) < 6:
+                debug_join_samples.append(f"ydist={dist:.2f} | ID: {lr['raw']} || DATES: {' | '.join(dl['tokens'][:25])}")
 
             rows.append({
                 "major_group": current_major_group or "Unknown",
@@ -236,11 +234,14 @@ def extract(pdf_path: str, out_csv: str):
             })
 
     print(f"[DEBUG] PDF pages: {total_pages}")
-    print(f"[DEBUG] Left ID/name rows found: {debug_left}")
-    print(f"[DEBUG] Right date rows found: {debug_right}")
+    print(f"[DEBUG] ID lines found total: {debug_id_lines}")
+    print(f"[DEBUG] Date lines found total: {debug_date_lines}")
     print(f"[DEBUG] Joined rows produced: {debug_joined}")
+    print("[DEBUG] Sample date lines:")
+    for s in debug_date_samples:
+        print("   ", s)
     print("[DEBUG] Sample joins:")
-    for s in debug_samples:
+    for s in debug_join_samples:
         print("   ", s)
 
     headers = [
