@@ -4,16 +4,9 @@ from dateutil.parser import parse as dtparse
 import pandas as pd
 import fitz  # PyMuPDF
 
-# Hyphen variants that appear inside PDF text
+# Unicode hyphens inside tokens
 HYPHEN_CLASS = r"[-\u2010\u2011\u2012\u2013\u2014\u2212\uFE63\uFF0D]"
-HYPHEN_CHARS = set(["-", "‐", "-", "‒", "–", "—", "−", "﹣", "－"])
-
-# Full date inside one token (supports unicode hyphens and optional '*')
 FULL_DATE_RE = re.compile(rf"^\s*(\d{{4}}){HYPHEN_CLASS}(\d{{2}}){HYPHEN_CLASS}(\d{{2}})\*?\s*$")
-
-# Split parts
-YEAR_RE = re.compile(r"^\d{4}$")
-MD_RE = re.compile(r"^\d{2}$")
 
 ACT_ID_RE = re.compile(r"^[A-Z]{1,6}\d{2,7}$", re.IGNORECASE)
 PKG_RE = re.compile(r"^[A-Z]\d{2,3}$", re.IGNORECASE)
@@ -32,10 +25,9 @@ WORKTYPE_RULES = [
 ]
 
 def normalize_token(t: str) -> str:
-    """Remove hidden chars and normalize unicode hyphens inside tokens."""
     t = (t or "").strip()
     t = t.replace("\u200b", "").replace("\ufeff", "").replace("\xa0", " ")
-    # Normalize any unicode hyphens to '-'
+    # normalize unicode hyphens to "-"
     t = re.sub(HYPHEN_CLASS, "-", t)
     return t
 
@@ -59,8 +51,25 @@ def infer_work_type(name: str) -> str:
 def parse_iso(iso: str):
     return dtparse(iso).date()
 
-def build_lines(words):
-    """Group by (block_no, line_no) for stable fragments."""
+def extract_full_dates_from_tokens(tokens):
+    """
+    Return list of found full-date tokens in order.
+    Each item: {"iso": "YYYY-MM-DD", "star": bool}
+    """
+    out = []
+    for tok in tokens:
+        raw = (tok or "").strip()
+        star = raw.endswith("*")
+        norm = normalize_token(raw).replace("*", "")
+        m = FULL_DATE_RE.match(norm)
+        if m:
+            out.append({"iso": f"{m.group(1)}-{m.group(2)}-{m.group(3)}", "star": star})
+    return out
+
+def build_fragments(words):
+    """
+    Build line fragments by (block_no,line_no) and keep their y-mid for clustering.
+    """
     line_map = {}
     for w in words:
         x0, y0, x1, y1, txt, block_no, line_no, word_no = w
@@ -70,78 +79,63 @@ def build_lines(words):
         key = (block_no, line_no)
         line_map.setdefault(key, []).append((x0, y0, x1, y1, txt))
 
-    lines = []
+    frags = []
     for ws in line_map.values():
-        ws_sorted = sorted(ws, key=lambda z: z[0])  # x0
-        tokens = [z[4] for z in ws_sorted if z[4]]
+        ws = sorted(ws, key=lambda z: z[0])
+        tokens = [z[4] for z in ws if z[4]]
         if not tokens:
             continue
-        x0 = min(z[0] for z in ws_sorted)
-        x1 = max(z[2] for z in ws_sorted)
-        y0 = min(z[1] for z in ws_sorted)
-        y1 = max(z[3] for z in ws_sorted)
+        y0 = min(z[1] for z in ws)
+        y1 = max(z[3] for z in ws)
         ymid = (y0 + y1) / 2.0
-        lines.append({"x0": x0, "x1": x1, "ymid": ymid, "tokens": tokens})
-    return lines
+        x0 = min(z[0] for z in ws)
+        frags.append({"ymid": ymid, "x0": x0, "tokens": tokens})
+    return frags
 
-def extract_dates_from_tokens(tokens):
+def cluster_by_y(frags, y_tol=2.0):
     """
-    Return list of found dates in reading order.
-    Each item: {"idx": token_index, "iso": "YYYY-MM-DD", "star": bool}
-    Detects:
-      A) Full date token: 2030-08-15 or 2026-02-15*
-      B) Split tokens: 2030 - 08 - 15 *
+    Cluster fragments into rows by ymid; within each row keep tokens ordered by x0.
     """
-    dates = []
+    frags = sorted(frags, key=lambda f: (f["ymid"], f["x0"]))
+    clusters = []
+    cur = []
+    cur_y = None
 
-    # A) full-token dates
-    for i, tok in enumerate(tokens):
-        raw = (tok or "").strip()
-        star = raw.endswith("*")
-        norm = normalize_token(raw).replace("*", "")
-        m = FULL_DATE_RE.match(norm)
-        if m:
-            iso = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-            dates.append({"idx": i, "iso": iso, "star": star})
+    for f in frags:
+        if cur_y is None:
+            cur = [f]
+            cur_y = f["ymid"]
+        else:
+            if abs(f["ymid"] - cur_y) <= y_tol:
+                cur.append(f)
+            else:
+                clusters.append(cur)
+                cur = [f]
+                cur_y = f["ymid"]
+    if cur:
+        clusters.append(cur)
 
-    # B) split dates (only if needed, but safe to run always)
-    i = 0
-    n = len(tokens)
-    while i < n:
-        t0 = normalize_token(tokens[i])
-        if YEAR_RE.match(t0) and i + 4 < n:
-            t1 = normalize_token(tokens[i+1])
-            t2 = normalize_token(tokens[i+2])
-            t3 = normalize_token(tokens[i+3])
-            t4 = normalize_token(tokens[i+4])
+    rows = []
+    for cl in clusters:
+        cl = sorted(cl, key=lambda f: f["x0"])
+        tokens = []
+        for f in cl:
+            tokens.extend(f["tokens"])
+        rows.append({"ymid": sum(f["ymid"] for f in cl) / len(cl), "tokens": tokens})
+    return rows
 
-            # hyphen token might be its own token OR already normalized to '-'
-            if (t1 in HYPHEN_CHARS or t1 == "-") and MD_RE.match(t2) and (t3 in HYPHEN_CHARS or t3 == "-") and MD_RE.match(t4):
-                star = False
-                j = i + 5
-                if j < n:
-                    nxt = normalize_token(tokens[j])
-                    if nxt == "*":
-                        star = True
-                        j += 1
-                iso = f"{t0}-{t2}-{t4}"
-                dates.append({"idx": i, "iso": iso, "star": star})
-                i = j
-                continue
-        i += 1
-
-    # De-duplicate by (iso, idx) while keeping order
-    seen = set()
-    out = []
-    for d in sorted(dates, key=lambda x: x["idx"]):
-        key = (d["iso"], d["idx"])
-        if key not in seen:
-            seen.add(key)
-            out.append(d)
-    return out
+def nearest_row(rows, y):
+    best = None
+    best_d = 1e18
+    for r in rows:
+        d = abs(r["ymid"] - y)
+        if d < best_d:
+            best_d = d
+            best = r
+    return best, best_d
 
 def extract(pdf_path: str, out_csv: str):
-    rows = []
+    rows_out = []
     current_package_code = None
     current_package_name = None
     current_major_group = None
@@ -149,16 +143,16 @@ def extract(pdf_path: str, out_csv: str):
     doc = fitz.open(pdf_path)
     total_pages = doc.page_count
 
-    debug_id_lines = 0
-    debug_date_lines = 0
+    debug_date_rows = 0
+    debug_id_rows = 0
+    debug_offset = []
     debug_joined = 0
-    debug_date_samples = []
-    debug_join_samples = []
+    debug_samples = []
 
     for page_i in range(total_pages):
         page = doc.load_page(page_i)
 
-        # Major group (best effort)
+        # Major group headings (best effort)
         text = page.get_text("text") or ""
         for ln in (text.splitlines() if text else []):
             l = ln.strip().lower()
@@ -175,70 +169,73 @@ def extract(pdf_path: str, out_csv: str):
         if not words:
             continue
 
-        lines = build_lines(words)
+        frags = build_fragments(words)
 
-        id_lines = []
-        date_lines = []
+        # Row clusters for whole page (this is where dates finally group together)
+        y_rows = cluster_by_y(frags, y_tol=2.0)
 
-        for ln in lines:
-            toks = ln["tokens"]
-            if len(toks) < 2:
-                continue
+        # Build date-rows: rows that contain >=2 FULL dates (like 2026-02-15)
+        date_rows = []
+        for r in y_rows:
+            dates = extract_full_dates_from_tokens(r["tokens"])
+            if len(dates) >= 2:
+                date_rows.append({"ymid": r["ymid"], "dates": dates, "raw": " | ".join(r["tokens"][:35])})
+        date_rows.sort(key=lambda r: r["ymid"])
 
+        # Build id-rows: rows that contain an activity id
+        id_rows = []
+        for r in y_rows:
+            toks = r["tokens"]
+            # skip obvious headers
             head = " ".join(toks[:3]).lower() if len(toks) >= 3 else " ".join(toks).lower()
             if head.startswith("activity id") or head.startswith("activityid"):
                 continue
-            if toks[0].lower() in ("month", "page"):
+            if toks and toks[0].lower() in ("month", "page"):
                 continue
 
-            # ID line
             act_id = None
             act_pos = None
-            for i in range(min(6, len(toks))):
+            for i in range(min(8, len(toks))):
                 if looks_like_activity_id(toks[i]):
                     act_id = normalize_token(toks[i]).upper()
                     act_pos = i
                     break
             if act_id:
                 name = " ".join(normalize_token(x) for x in toks[act_pos+1:]).strip()
-                id_lines.append({"ymid": ln["ymid"], "activity_id": act_id, "activity_name": name, "raw": " | ".join(toks[:30])})
+                id_rows.append({"ymid": r["ymid"], "activity_id": act_id, "activity_name": name, "raw": " | ".join(toks[:35])})
+        id_rows.sort(key=lambda r: r["ymid"])
 
-            # Date line (using robust date extraction)
-            found_dates = extract_dates_from_tokens(toks)
-            if len(found_dates) >= 2:
-                date_lines.append({"ymid": ln["ymid"], "dates": found_dates, "raw": " | ".join(toks[:40])})
-                if len(debug_date_samples) < 8:
-                    debug_date_samples.append(" | ".join(toks[:40]))
+        debug_date_rows += len(date_rows)
+        debug_id_rows += len(id_rows)
 
-        id_lines.sort(key=lambda r: r["ymid"])
-        date_lines.sort(key=lambda r: r["ymid"])
-
-        debug_id_lines += len(id_lines)
-        debug_date_lines += len(date_lines)
-
-        if not id_lines or not date_lines:
+        if not date_rows or not id_rows:
             continue
 
-        # Join by nearest Y
-        Y_JOIN_MAX = 14.0
+        # Learn page-specific offset between date rows and id rows
+        # (because the two columns may be vertically shifted)
+        diffs = []
+        for dr in date_rows:
+            nr, dist = nearest_row(id_rows, dr["ymid"])
+            if nr and dist < 20.0:
+                diffs.append(nr["ymid"] - dr["ymid"])
+        if diffs:
+            diffs_sorted = sorted(diffs)
+            offset = diffs_sorted[len(diffs_sorted)//2]  # median
+        else:
+            offset = 0.0
 
-        def nearest_id(y):
-            best = None
-            best_d = 1e9
-            for r in id_lines:
-                d = abs(r["ymid"] - y)
-                if d < best_d:
-                    best_d = d
-                    best = r
-            return best, best_d
+        debug_offset.append(offset)
 
-        for dl in date_lines:
-            lr, dist = nearest_id(dl["ymid"])
-            if not lr or dist > Y_JOIN_MAX:
+        # Join using offset-corrected y
+        Y_JOIN_MAX = 25.0
+        for dr in date_rows:
+            target_y = dr["ymid"] + offset
+            ir, dist = nearest_row(id_rows, target_y)
+            if not ir or dist > Y_JOIN_MAX:
                 continue
 
-            start = dl["dates"][-2]
-            finish = dl["dates"][-1]
+            start = dr["dates"][-2]
+            finish = dr["dates"][-1]
 
             try:
                 start_d = parse_iso(start["iso"])
@@ -250,18 +247,20 @@ def extract(pdf_path: str, out_csv: str):
             if duration_days < 0:
                 continue
 
-            act_id = lr["activity_id"]
-            name = lr["activity_name"]
+            act_id = ir["activity_id"]
+            name = ir["activity_name"]
 
             if is_package_code(act_id):
                 current_package_code = act_id
                 current_package_name = name
 
             debug_joined += 1
-            if len(debug_join_samples) < 6:
-                debug_join_samples.append(f"ydist={dist:.2f} | ID: {lr['raw']} || DATES: {dl['raw']}")
+            if len(debug_samples) < 8:
+                debug_samples.append(
+                    f"offset={offset:.2f} ydist={dist:.2f} | ID: {ir['raw']} || DATES: {dr['raw']}"
+                )
 
-            rows.append({
+            rows_out.append({
                 "major_group": current_major_group or "Unknown",
                 "package_code": current_package_code,
                 "package_name": current_package_name,
@@ -279,14 +278,14 @@ def extract(pdf_path: str, out_csv: str):
             })
 
     print(f"[DEBUG] PDF pages: {total_pages}")
-    print(f"[DEBUG] ID lines found total: {debug_id_lines}")
-    print(f"[DEBUG] Date lines found total: {debug_date_lines}")
+    print(f"[DEBUG] Date rows found (clustered): {debug_date_rows}")
+    print(f"[DEBUG] ID rows found (clustered): {debug_id_rows}")
+    if debug_offset:
+        off_med = sorted(debug_offset)[len(debug_offset)//2]
+        print(f"[DEBUG] Learned median offset across pages: {off_med:.2f}")
     print(f"[DEBUG] Joined rows produced: {debug_joined}")
-    print("[DEBUG] Sample date lines:")
-    for s in debug_date_samples:
-        print("   ", s)
     print("[DEBUG] Sample joins:")
-    for s in debug_join_samples:
+    for s in debug_samples:
         print("   ", s)
 
     headers = [
@@ -295,7 +294,7 @@ def extract(pdf_path: str, out_csv: str):
     ]
     Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows_out)
     if df.empty:
         print("[WARN] No rows extracted. Writing empty CSV with headers.")
         pd.DataFrame(columns=headers).to_csv(out_csv, index=False)
