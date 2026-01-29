@@ -171,7 +171,7 @@ def extract(pdf_path: str, out_csv: str):
 
         frags = build_fragments(words)
 
-        # Row clusters for whole page (this is where dates finally group together)
+        # Row clusters for whole page (this is where dates group together)
         y_rows = cluster_by_y(frags, y_tol=2.0)
 
         # Build date-rows: rows that contain >=2 FULL dates (like 2026-02-15)
@@ -186,6 +186,9 @@ def extract(pdf_path: str, out_csv: str):
         id_rows = []
         for r in y_rows:
             toks = r["tokens"]
+            if not toks:
+                continue
+
             # skip obvious headers
             head = " ".join(toks[:3]).lower() if len(toks) >= 3 else " ".join(toks).lower()
             if head.startswith("activity id") or head.startswith("activityid"):
@@ -201,9 +204,23 @@ def extract(pdf_path: str, out_csv: str):
                     act_pos = i
                     break
             if act_id:
-                name = " ".join(normalize_token(x) for x in toks[act_pos+1:]).strip()
+                name = " ".join(normalize_token(x) for x in toks[act_pos + 1 :]).strip()
                 id_rows.append({"ymid": r["ymid"], "activity_id": act_id, "activity_name": name, "raw": " | ".join(toks[:35])})
         id_rows.sort(key=lambda r: r["ymid"])
+
+        # 🔎 TEMP DEBUG — print one sample from first page only
+        if page_i == 0:
+            print("=== SAMPLE DEBUG (PAGE 1) ===")
+            if id_rows:
+                print("SAMPLE ID ROW:", id_rows[0]["raw"])
+            else:
+                print("SAMPLE ID ROW: NONE")
+
+            if date_rows:
+                print("SAMPLE DATE ROW:", date_rows[0]["raw"])
+            else:
+                print("SAMPLE DATE ROW: NONE")
+            print("=== END SAMPLE DEBUG ===")
 
         debug_date_rows += len(date_rows)
         debug_id_rows += len(id_rows)
@@ -212,18 +229,12 @@ def extract(pdf_path: str, out_csv: str):
             continue
 
         # Learn page-specific offset between date rows and id rows
-        # (because the two columns may be vertically shifted)
         diffs = []
         for dr in date_rows:
             nr, dist = nearest_row(id_rows, dr["ymid"])
             if nr and dist < 20.0:
                 diffs.append(nr["ymid"] - dr["ymid"])
-        if diffs:
-            diffs_sorted = sorted(diffs)
-            offset = diffs_sorted[len(diffs_sorted)//2]  # median
-        else:
-            offset = 0.0
-
+        offset = sorted(diffs)[len(diffs)//2] if diffs else 0.0
         debug_offset.append(offset)
 
         # Join using offset-corrected y
